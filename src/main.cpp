@@ -4,67 +4,91 @@
 #include <vector>
 #include <cmath>
 #include <string>
-
-#define MAX_INPUT 3
+#include <unordered_set>
+#include <set>
+#include <stack>
 
 enum dag_type {
-	CONSTANT, INPUT, ADD, SUB, NEG, MUL, DIV, FMA
+	CONSTANT = 0, INPUT = 1, ADD = 2, SUB = 3, NEG = 4, MUL = 5, DIV = 6, FMA = 7
 };
 
 struct dag_node;
-
 using dag_ptr = std::shared_ptr<dag_node>;
+struct dag_hash {
+	size_t operator()(std::weak_ptr<dag_node> ptr) const {
+		return (size_t) std::shared_ptr<dag_node>(ptr).get();
+	}
+};
+
+using dag_list_t = std::unordered_set<std::weak_ptr<dag_node>, dag_hash>;
+
+dag_list_t dag_list;
+
+std::stack<std::string> var_names;
 
 struct dag_node {
 	dag_type op;
 	bool sat;
+	bool fixed;
 	std::string name;
-	std::array<dag_ptr, MAX_INPUT> inp;
+	std::vector<dag_ptr> in;
+	~dag_node() {
+		if (op != CONSTANT && name != "") {
+			var_names.push(name);
+		}
+	}
 };
 
-static int var_cnt = -1;
-
-std::vector<std::weak_ptr<dag_node>> dag_list;
+static int var_cnt = 0;
 
 std::string gen_varname() {
-	var_cnt++;
-	return std::string("var") + std::to_string(var_cnt);
+	if (var_names.size()) {
+		auto m = var_names.top();
+		var_names.pop();
+		return m;
+	} else {
+		return std::string("var") + std::to_string(var_cnt++);
+	}
+}
+
+bool operator==(std::weak_ptr<dag_node> a, std::weak_ptr<dag_node> b) {
+	return std::shared_ptr<dag_node>(a).get() == std::shared_ptr<dag_node>(b).get();
 }
 
 std::shared_ptr<dag_node> new_node(std::string nm = "") {
 	auto dag = std::make_shared<dag_node>();
-	if (nm == "") {
-		dag->name = gen_varname();
-	} else {
-		dag->name = nm;
-	}
+	dag->name = nm;
+	dag->fixed = false;
 	dag->sat = false;
-	dag_list.push_back(dag);
+	dag_list.insert(std::weak_ptr<dag_node>(dag));
 	return dag;
 }
 
 void optimize_fma() {
 	for (const auto weak : dag_list) {
-		dag_ptr node = dag_ptr(weak);
-		if (node->op == ADD) {
-			int i = -1;
-			int j;
-			if (node->inp[0]->op == MUL) {
-				i = 0;
-				j = 1;
-			} else if (node->inp[1]->op == MUL) {
-				i = 1;
-				j = 0;
-			}
-			if (i != -1) {
-				node->op = FMA;
-				auto replace = node->inp[i];
-				auto a = replace->inp[0];
-				auto b = replace->inp[1];
-				auto c = node->inp[j];
-				node->inp[0] = a;
-				node->inp[1] = b;
-				node->inp[2] = c;
+		if (weak.use_count()) {
+			dag_ptr node = dag_ptr(weak);
+			if (node->op == ADD) {
+				int i = -1;
+				int j;
+				if (node->in[0]->op == MUL) {
+					i = 0;
+					j = 1;
+				} else if (node->in[1]->op == MUL) {
+					i = 1;
+					j = 0;
+				}
+				if (i != -1) {
+					node->op = FMA;
+					auto replace = node->in[i];
+					auto a = replace->in[0];
+					auto b = replace->in[1];
+					auto c = node->in[j];
+					node->in.resize(0);
+					node->in.push_back(a);
+					node->in.push_back(b);
+					node->in.push_back(c);
+				}
 			}
 		}
 	}
@@ -75,8 +99,9 @@ dag_ptr operator+(dag_ptr a, dag_ptr b) {
 
 	auto ptr = new_node(nm);
 	ptr->op = ADD;
-	ptr->inp[0] = a;
-	ptr->inp[1] = b;
+	ptr->in.resize(0);
+	ptr->in.push_back(a);
+	ptr->in.push_back(b);
 	return ptr;
 }
 
@@ -85,8 +110,19 @@ dag_ptr operator-(dag_ptr a, dag_ptr b) {
 
 	auto ptr = new_node(nm);
 	ptr->op = SUB;
-	ptr->inp[0] = a;
-	ptr->inp[1] = b;
+	ptr->in.resize(0);
+	ptr->in.push_back(a);
+	ptr->in.push_back(b);
+	return ptr;
+}
+
+dag_ptr operator-(dag_ptr a) {
+	std::string nm;
+
+	auto ptr = new_node(nm);
+	ptr->op = NEG;
+	ptr->in.resize(0);
+	ptr->in.push_back(a);
 	return ptr;
 }
 
@@ -95,43 +131,65 @@ dag_ptr operator*(dag_ptr a, dag_ptr b) {
 
 	auto ptr = new_node(nm);
 	ptr->op = MUL;
-	ptr->inp[0] = a;
-	ptr->inp[1] = b;
+	ptr->in.resize(0);
+	ptr->in.push_back(a);
+	ptr->in.push_back(b);
 	return ptr;
 }
 
 dag_ptr dag_constant(double a) {
-	auto ptr = new_node(std::to_string(a));
-	ptr->op = CONSTANT;
-	return ptr;
+	char* ptr;
+	asprintf(&ptr, "double(%.17e)", a);
+	auto dag = new_node(ptr);
+	free(ptr);
+	dag->sat = true;
+	dag->op = CONSTANT;
+	return dag;
 }
 
 std::vector<std::string> gen_code(dag_ptr out) {
 	std::vector<std::string> rc;
-	if (out->sat) {
-		return std::vector<std::string>();
-	}
 	std::string cmd;
-	for (int i = 0; i < MAX_INPUT; i++) {
-		if (out->inp[i] == nullptr) {
-			break;
+	for (auto & i : out->in) {
+		if (!i->sat) {
+			auto child = gen_code(i);
+			rc.insert(rc.end(), child.begin(), child.end());
 		}
-		auto child = gen_code(out->inp[i]);
-		rc.insert(rc.end(), child.begin(), child.end());
-		out->sat = true;
+	}
+	if (out->name == "") {
+		out->name = gen_varname();
 	}
 	switch (out->op) {
 	case ADD:
-		cmd = out->name + " = " + out->inp[0]->name + " + " + out->inp[1]->name + ";";
+		if (out->name == out->in[0]->name) {
+			cmd = out->name + " += " + out->in[1]->name + ";";
+		} else if (out->name == out->in[1]->name) {
+			cmd = out->name + " += " + out->in[0]->name + ";";
+		} else {
+			cmd = out->name + " = " + out->in[0]->name + " + " + out->in[1]->name + ";";
+		}
 		break;
 	case SUB:
-		cmd = out->name + " = " + out->inp[0]->name + " - " + out->inp[1]->name + ";";
+		if (out->name == out->in[0]->name) {
+			cmd = out->name + " -= " + out->in[1]->name + ";";
+		} else {
+			cmd = out->name + " = " + out->in[0]->name + " - " + out->in[1]->name + ";";
+		}
+		break;
+	case NEG:
+		cmd = out->name + " = -" + out->in[0]->name + ";";
 		break;
 	case MUL:
-		cmd = out->name + " = " + out->inp[0]->name + " * " + out->inp[1]->name + ";";
+		if (out->name == out->in[0]->name) {
+			cmd = out->name + " *= " + out->in[1]->name + ";";
+		} else if (out->name == out->in[1]->name) {
+			cmd = out->name + " *= " + out->in[0]->name + ";";
+		} else {
+			cmd = out->name + " = " + out->in[0]->name + " * " + out->in[1]->name + ";";
+		}
 		break;
 	case FMA:
-		cmd = out->name + " = std::fma(" + out->inp[0]->name + ", " + out->inp[1]->name + ", " + out->inp[2]->name + ");";
+		cmd = out->name + " = std::fma(" + out->in[0]->name + ", " + out->in[1]->name + ", " + out->in[2]->name + ");";
 		break;
 	case INPUT:
 		break;
@@ -139,12 +197,13 @@ std::vector<std::string> gen_code(dag_ptr out) {
 	if (cmd != "") {
 		rc.push_back(cmd);
 	}
+	out->in.clear();
 	out->sat = true;
 	return rc;
 }
 
 void print_code(std::vector<std::string> code, std::string fname, int incount, int outcount) {
-	printf("std::vector<double> %s(const std::vector<double> xn) {;\n", fname.c_str());
+	printf("std::vector<double> %s(std::vector<double> xn) {;\n", fname.c_str());
 	printf("\tstd::vector<double> Xk(%i);\n", outcount);
 	printf("\tdouble ");
 	for (int i = 0; i < var_cnt; i++) {
@@ -179,14 +238,44 @@ std::vector<dag_ptr> fft_radix2(std::vector<dag_ptr> xin, int N) {
 	odd = fft_radix2(odd, N / 2);
 	for (int k = 0; k < N / 2; k++) {
 		double theta = -2.0 * M_PI * k / N;
-		auto twr = dag_constant(cos(theta));
-		auto twi = dag_constant(sin(theta));
-		auto tr = odd[2 * k] * twr - odd[2 * k + 1] * twi;
-		auto ti = odd[2 * k] * twi + odd[2 * k + 1] * twr;
-		xout[2 * k] = even[2 * k] + tr;
-		xout[2 * (k + N / 2)] = even[2 * k] - tr;
-		xout[2 * k + 1] = even[2 * k + 1] + ti;
-		xout[2 * (k + N / 2) + 1] = even[2 * k + 1] - ti;
+		if (k == 0) {
+			auto tr = odd[2 * k];
+			auto ti = odd[2 * k + 1];
+			xout[2 * k] = even[2 * k] + tr;
+			xout[2 * (k + N / 2)] = even[2 * k] - tr;
+			xout[2 * k + 1] = even[2 * k + 1] + ti;
+			xout[2 * (k + N / 2) + 1] = even[2 * k + 1] - ti;
+		} else if (k == N / 2) {
+			auto tr = -odd[2 * k];
+			auto ti = -odd[2 * k + 1];
+			xout[2 * k] = even[2 * k] + tr;
+			xout[2 * (k + N / 2)] = even[2 * k] - tr;
+			xout[2 * k + 1] = even[2 * k + 1] + ti;
+			xout[2 * (k + N / 2) + 1] = even[2 * k + 1] - ti;
+		} else if (k == N / 4) {
+			auto tr = odd[2 * k + 1];
+			auto ti = -odd[2 * k];
+			xout[2 * k] = even[2 * k] + tr;
+			xout[2 * (k + N / 2)] = even[2 * k] - tr;
+			xout[2 * k + 1] = even[2 * k + 1] + ti;
+			xout[2 * (k + N / 2) + 1] = even[2 * k + 1] - ti;
+		} else if (k == 3 * N / 4) {
+			auto tr = -odd[2 * k + 1];
+			auto ti = odd[2 * k];
+			xout[2 * k] = even[2 * k] + tr;
+			xout[2 * (k + N / 2)] = even[2 * k] - tr;
+			xout[2 * k + 1] = even[2 * k + 1] + ti;
+			xout[2 * (k + N / 2) + 1] = even[2 * k + 1] - ti;
+		} else {
+			auto twr = dag_constant(cos(theta));
+			auto twi = dag_constant(sin(theta));
+			auto tr = odd[2 * k] * twr - odd[2 * k + 1] * twi;
+			auto ti = odd[2 * k] * twi + odd[2 * k + 1] * twr;
+			xout[2 * k] = even[2 * k] + tr;
+			xout[2 * (k + N / 2)] = even[2 * k] - tr;
+			xout[2 * k + 1] = even[2 * k + 1] + ti;
+			xout[2 * (k + N / 2) + 1] = even[2 * k + 1] - ti;
+		}
 	}
 	return xout;
 }
@@ -233,51 +322,128 @@ void print_test_code(int N) {
 			"double rand1() {\n"
 			"\treturn (rand() + 0.5) / RAND_MAX;\n"
 			"}\n"
-			"\n"
-			"int main() {\n"
-			"\tconstexpr int N = ");
-	printf(std::string(std::to_string(N) + ";\n"
-			"\tstd::vector<double> xin(2 * N);\n"
-			"\tstd::vector<std::complex<double>> y(N);\n"
-			"\tfor( int n = 0; n < 2 * N; n++) {\n"
-			"\t\txin[n] = rand1();\n"
-			"\t\tif( n % 2 == 0 ) {\n"
-			"\t\t\ty[n / 2].real(xin[n]);\n"
-			"\t\t} else {\n"
-			"\t\t\ty[n / 2].imag(xin[n]);\n"
-			"\t\t}\n"
-			"\t}\n"
-			"\tauto xout = test(xin);\n"
-			"\tfftw(y);\n"
-			"\tfor( int n = 0; n < N; n++) {\n"
-			"\t\tprintf( \"%%i %%e %%e %%e %%e\\n\", n, xout[2 * n], xout[2 * n + 1], y[n].real(), y[n].imag() );\n"
-			"\t}\n"
-			"}\n"
-			"\n"
-			"").c_str());
+			"\n");
+	printf(
+			"#include <chrono>\n"
+					"class timer {\n"
+					"\tstd::chrono::time_point<std::chrono::high_resolution_clock> start_time;\n"
+					"\tdouble time;\n"
+					"public:\n"
+					"\tinline timer() {\n"
+					"\t\ttime = 0.0;\n"
+					"\t}\n"
+					"\tinline void stop() {\n"
+					"\t\tstd::chrono::time_point<std::chrono::high_resolution_clock> stop_time = std::chrono::high_resolution_clock::now();\n"
+					"\t\tstd::chrono::duration<double> dur = stop_time - start_time;\n"
+					"\t\ttime += dur.count();\n"
+					"\t}\n"
+					"\tinline void start() {\n"
+					"\t\tstart_time = std::chrono::high_resolution_clock::now();\n"
+					"\t}\n"
+					"\tinline void reset() {\n"
+					"\t\ttime = 0.0;\n"
+					"\t}\n"
+					"\tinline double read() {\n"
+					"\t\treturn time;\n"
+					"\t}\n"
+					"};\n"
+					"\n"
+					"\n"
+					"\n"
+					"int main() {\n"
+					"\tconstexpr int N = %i;\n"
+					"\tstd::vector<double> xin(2 * N);\n"
+					"\tstd::vector<std::complex<double>> y(N);\n"
+					"\ttimer tm1, tm2;\n"
+					"\tfor( int i = 0; i < 256; i++) {\n"
+					"\t\tfor( int n = 0; n < 2 * N; n++) {\n"
+					"\t\t\txin[n] = rand1();\n"
+					"\t\t\tif( n %% 2 == 0 ) {\n"
+					"\t\t\t\ty[n / 2].real(xin[n]);\n"
+					"\t\t\t} else {\n"
+					"\t\t\t\ty[n / 2].imag(xin[n]);\n"
+					"\t\t\t}\n"
+					"\t\t}\n"
+					"\t\ttm1.start();\n"
+					"\t\tauto xout = test(xin);\n"
+					"\t\ttm1.stop();\n"
+					"\t\ttm2.start();\n"
+					"\t\tfftw(y);\n"
+					"\t\ttm2.stop();\n"
+					"\t\tdouble error = 0.0;\n"
+					"\t\tfor( int n = 0; n < N; n++) {\n"
+					"\t\t\terror += std::pow(xout[2 * n] - y[n].real(), 2);\n"
+					"\t\t\terror += std::pow(xout[2 * n + 1] - y[n].imag(), 2);\n"
+					"\t\t}\n"
+					"\t\terror = error / (2.0 * N);\n"
+					"\t\tif( i == 255 ) {\n"
+					"\t\t\tprintf( \"Error = %%e\\n\", error );\n"
+					"\t\t}\n"
+					"\t}\n"
+					"\tprintf( \"%%e %%e %%e\\n\", tm1.read(), tm2.read(), tm2.read() / tm1.read() );\n"
+					"\t\n"
+					"}\n"
+					"", N);
+}
+
+bool deps_ready(dag_ptr dag) {
+	for (auto in : dag->in) {
+		if (!in->sat) {
+			return false;
+		}
+	}
+	return true;
+}
+
+std::vector<dag_ptr> get_candidates() {
+	std::vector<dag_ptr> cands;
+	for (auto wdag : dag_list) {
+		if (wdag.use_count()) {
+			auto dag = dag_ptr(wdag);
+			if (!dag->sat) {
+				bool ready = true;
+				for (auto i : dag->in) {
+					if (!i->sat) {
+						ready = false;
+						break;
+					}
+				}
+				if (ready) {
+					cands.push_back(dag);
+				}
+			}
+		}
+	}
+	return cands;
 }
 
 int main() {
 	std::vector<dag_ptr> input;
-	int N = 64;
+	int N = 8;
 	for (int n = 0; n < 2 * N; n++) {
 		auto tmp = new_node(std::string("xn[") + std::to_string(n) + "]");
 		tmp->op = INPUT;
+		tmp->sat = true;
 		input.push_back(tmp);
 	}
 
 	auto output = fft_radix2(input, N);
+	input.clear();
 	for (int n = 0; n < 2 * N; n++) {
+		output[n]->fixed = true;
 		output[n]->name = std::string("Xk[") + std::to_string(n) + "]";
 	}
 	optimize_fma();
 	std::vector<std::string> code;
-	for (auto o : output) {
-		auto cd = gen_code(o);
+	auto cands = get_candidates();
+	while (cands.size()) {
+		auto cd = gen_code(cands.front());
 		code.insert(code.end(), cd.begin(), cd.end());
+		cands = get_candidates();
 	}
 	print_test_header();
 	print_code(code, "test", 2 * N, 2 * N);
 	print_test_code(N);
+	fprintf( stderr, "%i total ops\n", code.size());
 
 }
