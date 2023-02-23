@@ -21,11 +21,15 @@ dag_ptr operator+(dag_ptr a, dag_ptr b);
 dag_ptr operator-(dag_ptr a, dag_ptr b);
 dag_ptr operator*(dag_ptr a, dag_ptr b);
 dag_ptr operator-(dag_ptr a);
+struct dagcmp {
+	bool operator()(dag_ptr a, dag_ptr b) const;
+};
 
 class dag_node {
 	static std::unordered_set<dag_node*> directory;
 	static std::set<std::string> unused_names;
 	static std::unordered_map<std::string, dag_node*> used_names;
+	static std::vector<std::pair<double, std::weak_ptr<dag_node>>>constants;
 	static int var_cnt;
 	int outnum;
 	dag_type type;
@@ -64,6 +68,9 @@ public:
 	static int var_count() {
 		return var_cnt;
 	}
+	bool arithmetic() const {
+		return type == ADD || type == SUB || type == MUL || type == NEG || type == DIV || type == FMA;
+	}
 	static dag_ptr create(dag_type t, dag_ptr in1 = nullptr, dag_ptr in2 = nullptr, dag_ptr in3 = nullptr) {
 		auto ptr = std::make_shared<dag_node>();
 		ptr->type = t;
@@ -90,13 +97,44 @@ public:
 			directory.insert(ptr.get());
 			return ptr;
 		} else {
+			for( int i = 0; i < constants.size(); i++) {
+				double b = constants[i].first;
+				if( std::fabs(a-b) < 1e-14) {
+					return dag_ptr(constants[i].second);
+				}
+			}
 			auto ptr = std::make_shared<dag_node>();
 			ptr->type = CONSTANT;
 			ptr->self = ptr.get();
 			ptr->value = a;
 			ptr->name = std::to_string(a);
+			constants.push_back(std::make_pair(a,ptr));
 			directory.insert(ptr.get());
 			return ptr;
+		}
+	}
+	static void remove_duplicates() {
+		std::set<dag_ptr, dagcmp> uniques;
+		std::unordered_map<dag_ptr,std::vector<dag_ptr*>> outputs;
+		for( auto i = directory.begin(); i != directory.end(); i++) {
+			for( auto& in : (*i)->inputs) {
+				if( in->arithmetic() ) {
+					if( uniques.find(in) == uniques.end()) {
+						uniques.insert(in);
+					}
+					outputs[in].push_back(&in);
+				}
+			}
+		}
+		for( auto i : outputs) {
+			auto iter = uniques.find(i.first);
+			if( iter != uniques.end()) {
+				if( iter->get() != i.first.get()) {
+					for( auto* revin : i.second) {
+						*revin = *iter;
+					}
+				}
+			}
 		}
 	}
 	static dag_ptr create(dag_type t, std::string nm, dag_ptr in1 = nullptr) {
@@ -149,19 +187,16 @@ public:
 		}
 		return cnt;
 	}
-	static void remove_duplicates() {
 
-	}
 	static void propagate_signs() {
 		bool found_one = true;
 		while (found_one) {
 			std::vector<dag_node*> nodes(directory.begin(), directory.end());
 			found_one = false;
-			fprintf( stderr, "!\n");
 			for (auto& node : nodes) {
 				bool prop = false;
 				switch (node->type) {
-				case ADD:
+					case ADD:
 					if (node->inputs[0]->type == NEG && node->inputs[1]->type == NEG) {
 						node->inputs[0] = node->inputs[0]->inputs[0];
 						node->inputs[1] = node->inputs[1]->inputs[0];
@@ -175,7 +210,7 @@ public:
 						node->type = SUB;
 					}
 					break;
-				case SUB:
+					case SUB:
 					if (node->inputs[0]->type == NEG && node->inputs[1]->type == NEG) {
 						node->inputs[0] = node->inputs[0]->inputs[0];
 						node->inputs[1] = node->inputs[1]->inputs[0];
@@ -189,7 +224,7 @@ public:
 						node->type = ADD;
 					}
 					break;
-				case MUL:
+					case MUL:
 					if (node->inputs[0]->type == NEG && node->inputs[1]->type == NEG) {
 						node->inputs[0] = node->inputs[0]->inputs[0];
 						node->inputs[1] = node->inputs[1]->inputs[1];
@@ -217,6 +252,7 @@ public:
 
 	}
 	static std::vector<std::string> generate_program() {
+		fprintf(stderr, "op count = %i\n", dag_node::op_count());
 		std::vector<std::string> code;
 		bool found_one = true;
 		int opcnt = 0;
@@ -251,26 +287,26 @@ public:
 		}
 		std::string code;
 		switch (type) {
-		case CONSTANT:
+			case CONSTANT:
 			break;
-		case INPUT:
+			case INPUT:
 			break;
-		case ADD:
+			case ADD:
 			code = name + " = " + inputs[0]->name + " + " + inputs[1]->name + ";";
 			break;
-		case SUB:
+			case SUB:
 			code = name + " = " + inputs[0]->name + " - " + inputs[1]->name + ";";
 			break;
-		case NEG:
+			case NEG:
 			code = name + " = -" + inputs[0]->name + ";";
 			break;
-		case MUL:
+			case MUL:
 			code = name + " = " + inputs[0]->name + " * " + inputs[1]->name + ";";
 			break;
-		case FMA:
+			case FMA:
 			code = name + " = std::fma(" + inputs[0]->name + ", " + inputs[1]->name + ", " + inputs[2]->name + ";";
 			break;
-		case OUTPUT:
+			case OUTPUT:
 			std::string oname = "x[" + std::to_string(outnum) + "]";
 			auto cmd = reserve_name(oname);
 			if (cmd != "") {
@@ -295,8 +331,11 @@ public:
 			used_names.erase(name);
 		}
 	}
+	friend struct dagcmp;
 
 };
+
+std::vector<std::pair<double, std::weak_ptr<dag_node>>>dag_node::constants;
 
 dag_ptr operator+(dag_ptr a, dag_ptr b) {
 	return dag_node::create(ADD, a, b);
@@ -312,6 +351,24 @@ dag_ptr operator*(dag_ptr a, dag_ptr b) {
 
 dag_ptr operator-(dag_ptr a) {
 	return dag_node::create(NEG, a);
+}
+
+bool dagcmp::operator()(dag_ptr a, dag_ptr b) const {
+	if ((int) a->type < (int) b->type) {
+		return true;
+	} else if ((int) a->type > (int) b->type) {
+		return false;
+	} else {
+		for (int i = 0; i < a->inputs.size(); i++) {
+			if (a->inputs[i].get() < b->inputs[i].get()) {
+				return true;
+			} else if (a->inputs[i].get() > b->inputs[i].get()) {
+				return false;
+			}
+		}
+	}
+
+	return false;
 }
 
 void print_test_header() {
@@ -408,7 +465,7 @@ void print_test_code(int N) {
 					"\tstd::vector<double> xin(2 * N);\n"
 					"\tstd::vector<std::complex<double>> y(N);\n"
 					"\ttimer tm1, tm2;\n"
-					"\tfor( int i = 0; i < 256; i++) {\n"
+					"\tfor( int i = 0; i < 1; i++) {\n"
 					"\t\tfor( int n = 0; n < 2 * N; n++) {\n"
 					"\t\t\txin[n] = rand1();\n"
 					"\t\t\tif( n %% 2 == 0 ) {\n"
@@ -427,9 +484,10 @@ void print_test_code(int N) {
 					"\t\tfor( int n = 0; n < N; n++) {\n"
 					"\t\t\terror += std::pow(xout[2 * n] - y[n].real(), 2);\n"
 					"\t\t\terror += std::pow(xout[2 * n + 1] - y[n].imag(), 2);\n"
+					"\t\t\tprintf( \"%%i %%e %%e %%e %%e;\\n\", n, xout[2*n], xout[2*n+1], y[n].real(), y[n].imag())\n;\n"
 					"\t\t}\n"
 					"\t\terror = error / (2.0 * N);\n"
-					"\t\tif( i == 255 ) {\n"
+					"\t\tif( i == 0 ) {\n"
 					"\t\t\tprintf( \"Error = %%e\\n\", error );\n"
 					"\t\t}\n"
 					"\t}\n"
@@ -623,7 +681,7 @@ int dag_node::var_cnt = 0;
 
 int main() {
 	std::vector<dag_ptr> input;
-	int N = 8;
+	int N = 32;
 	for (int n = 0; n < 2 * N; n++) {
 		input.push_back(dag_node::create(INPUT, std::string("x[") + std::to_string(n) + "]"));
 	}
@@ -633,9 +691,8 @@ int main() {
 	for (int n = 0; n < 2 * N; n++) {
 		output[n] = dag_node::create(n, output[n]);
 	}
-	fprintf(stderr, "op count = %i\n", dag_node::op_count());
 	dag_node::propagate_signs();
-	fprintf(stderr, "op count = %i\n", dag_node::op_count());
+	dag_node::remove_duplicates();
 	auto prog = dag_node::generate_program();
 	print_test_header();
 	print_code(prog, "test", 2 * N, 2 * N);
