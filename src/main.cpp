@@ -17,6 +17,11 @@ class dag_node;
 
 using dag_ptr = std::shared_ptr<dag_node>;
 
+dag_ptr operator+(dag_ptr a, dag_ptr b);
+dag_ptr operator-(dag_ptr a, dag_ptr b);
+dag_ptr operator*(dag_ptr a, dag_ptr b);
+dag_ptr operator-(dag_ptr a);
+
 class dag_node {
 	static std::unordered_set<dag_node*> directory;
 	static std::set<std::string> unused_names;
@@ -76,13 +81,23 @@ public:
 		return ptr;
 	}
 	static dag_ptr create(double a) {
-		auto ptr = std::make_shared<dag_node>();
-		ptr->type = CONSTANT;
-		ptr->self = ptr.get();
-		ptr->value = a;
-		ptr->name = std::to_string(a);
-		directory.insert(ptr.get());
-		return ptr;
+		if (a < 0.0) {
+			auto neg = create(-a);
+			auto ptr = std::make_shared<dag_node>();
+			ptr->type = NEG;
+			ptr->self = ptr.get();
+			ptr->inputs.push_back(neg);
+			directory.insert(ptr.get());
+			return ptr;
+		} else {
+			auto ptr = std::make_shared<dag_node>();
+			ptr->type = CONSTANT;
+			ptr->self = ptr.get();
+			ptr->value = a;
+			ptr->name = std::to_string(a);
+			directory.insert(ptr.get());
+			return ptr;
+		}
 	}
 	static dag_ptr create(dag_type t, std::string nm, dag_ptr in1 = nullptr) {
 		auto ptr = std::make_shared<dag_node>();
@@ -107,6 +122,16 @@ public:
 		directory.insert(ptr.get());
 		return ptr;
 	}
+	static int op_count() {
+		int cnt = 0;
+		for (auto i = directory.begin(); i != directory.end(); i++) {
+			if ((*i)->type == ADD || (*i)->type == SUB || (*i)->type == MUL || (*i)->type == DIV || (*i)->type == NEG
+					|| (*i)->type == FMA) {
+				cnt++;
+			}
+		}
+		return cnt;
+	}
 	bool deps_satisfied() const {
 		for (auto ptr : inputs) {
 			if (ptr->inputs.size()) {
@@ -115,18 +140,106 @@ public:
 		}
 		return true;
 	}
+	int free_count() {
+		int cnt = 0;
+		for (auto& i : inputs) {
+			if (i.use_count() == 1) {
+				cnt++;
+			}
+		}
+		return cnt;
+	}
+	static void remove_duplicates() {
+
+	}
+	static void propagate_signs() {
+		bool found_one = true;
+		while (found_one) {
+			std::vector<dag_node*> nodes(directory.begin(), directory.end());
+			found_one = false;
+			fprintf( stderr, "!\n");
+			for (auto& node : nodes) {
+				bool prop = false;
+				switch (node->type) {
+				case ADD:
+					if (node->inputs[0]->type == NEG && node->inputs[1]->type == NEG) {
+						node->inputs[0] = node->inputs[0]->inputs[0];
+						node->inputs[1] = node->inputs[1]->inputs[0];
+						prop = true;
+					} else if (node->inputs[0]->type == NEG) {
+						node->inputs[0] = node->inputs[0]->inputs[0];
+						std::swap(node->inputs[0], node->inputs[1]);
+						node->type = SUB;
+					} else if (node->inputs[1]->type == NEG) {
+						node->inputs[1] = node->inputs[1]->inputs[0];
+						node->type = SUB;
+					}
+					break;
+				case SUB:
+					if (node->inputs[0]->type == NEG && node->inputs[1]->type == NEG) {
+						node->inputs[0] = node->inputs[0]->inputs[0];
+						node->inputs[1] = node->inputs[1]->inputs[0];
+						prop = true;
+					} else if (node->inputs[0]->type == NEG) {
+						node->inputs[0] = node->inputs[0]->inputs[0];
+						prop = true;
+						node->type = ADD;
+					} else if (node->inputs[1]->type == NEG) {
+						node->inputs[1] = node->inputs[1]->inputs[0];
+						node->type = ADD;
+					}
+					break;
+				case MUL:
+					if (node->inputs[0]->type == NEG && node->inputs[1]->type == NEG) {
+						node->inputs[0] = node->inputs[0]->inputs[0];
+						node->inputs[1] = node->inputs[1]->inputs[1];
+					} else if (node->inputs[0]->type == NEG) {
+						node->inputs[0] = node->inputs[0]->inputs[0];
+						prop = true;
+					} else if (node->inputs[1]->type == NEG) {
+						node->inputs[1] = node->inputs[1]->inputs[0];
+						prop = true;
+					}
+					break;
+				}
+				if (prop) {
+					found_one = true;
+					auto new_dag = create(node->type, node->inputs[0]);
+					for (int i = 1; i < node->inputs.size(); i++) {
+						new_dag->inputs.push_back(node->inputs[i]);
+					}
+					node->type = NEG;
+					node->inputs.resize(1);
+					node->inputs[0] = new_dag;
+				}
+			}
+		}
+
+	}
 	static std::vector<std::string> generate_program() {
 		std::vector<std::string> code;
 		bool found_one = true;
+		int opcnt = 0;
 		while (found_one) {
 			found_one = false;
+			std::vector<dag_node*> candidates;
 			for (auto i = directory.begin(); i != directory.end(); i++) {
 				if ((*i)->inputs.size() && (*i)->deps_satisfied()) {
 					found_one = true;
-					auto tmp = (*i)->gen_code();
-					code.insert(code.end(), tmp.begin(), tmp.end());
-					break;
+					candidates.push_back(*i);
 				}
+			}
+			if (found_one) {
+				int best_cnt = 0;
+				dag_node* best_dag = candidates.front();
+				for (auto cand : candidates) {
+					if (cand->free_count() > best_cnt) {
+						best_cnt = cand->free_count();
+						best_dag = cand;
+					}
+				}
+				auto tmp = best_dag->gen_code();
+				code.insert(code.end(), tmp.begin(), tmp.end());
 			}
 		}
 		return code;
@@ -386,6 +499,123 @@ std::vector<dag_ptr> fft_radix2(std::vector<dag_ptr> xin, int N) {
 	return xout;
 }
 
+std::vector<dag_ptr> fft_radix4(std::vector<dag_ptr> xin, int N) {
+	if (N == 1) {
+		return xin;
+	}
+	std::vector<dag_ptr> xout(2 * N);
+	std::vector<dag_ptr> even, odd1, odd3;
+	for (int n = 0; n < N / 2; n++) {
+		even.push_back(xin[4 * n]);
+		even.push_back(xin[4 * n + 1]);
+	}
+	for (int n = 0; n < N / 4; n++) {
+		odd1.push_back(xin[8 * n + 2]);
+		odd1.push_back(xin[8 * n + 3]);
+		odd3.push_back(xin[8 * n + 6]);
+		odd3.push_back(xin[8 * n + 7]);
+	}
+	if (N == 4) {
+		even = fft_radix2(even, 2);
+		odd1 = fft_radix2(odd1, 1);
+		odd3 = fft_radix2(odd3, 1);
+	} else if (N == 8) {
+		even = fft_radix4(even, 4);
+		odd1 = fft_radix2(odd1, 2);
+		odd3 = fft_radix2(odd3, 2);
+	} else {
+		even = fft_radix4(even, N / 2);
+		odd1 = fft_radix4(odd1, N / 4);
+		odd3 = fft_radix4(odd3, N / 4);
+	}
+	const auto tw_mult = [N](int k, dag_ptr r, dag_ptr i) {
+		std::pair<dag_ptr, dag_ptr> rc;
+		double theta = -2.0 * M_PI * k / N;
+		if( k == 0 ) {
+			rc.first = r;
+			rc.second = i;
+		} else if( k == N / 2 ) {
+			rc.first = i;
+			rc.second = -r;
+		} else if( k == N / 4 ) {
+			rc.first = -r;
+			rc.second = -i;
+		} else if( k == 3 * N / 4 ) {
+			rc.first = -i;
+			rc.second = r;
+		} else {
+			auto twr = dag_node::create(cos(theta));
+			auto twi = dag_node::create(sin(theta));
+			rc.first = r * twr - i * twi;
+			rc.second = i * twr + r * twi;
+		}
+		return rc;
+	};
+	for (int k = 0; k < N / 4; k++) {
+		auto odds1 = tw_mult(k, odd1[2 * k], odd1[2 * k + 1]);
+		auto odds3 = tw_mult(3 * k, odd3[2 * k], odd3[2 * k + 1]);
+		auto zsr = odds1.first + odds3.first;
+		auto zsi = odds1.second + odds3.second;
+		auto zdr = odds1.first - odds3.first;
+		auto zdi = odds1.second - odds3.second;
+		auto ur0 = even[2 * k + 0] + zsr;
+		auto ui0 = even[2 * k + 1] + zsi;
+		auto ur1 = even[2 * (k + N / 4) + 0] + zdi;
+		auto ui1 = even[2 * (k + N / 4) + 1] - zdr;
+		auto ur2 = even[2 * k + 0] - zsr;
+		auto ui2 = even[2 * k + 1] - zsi;
+		auto ur3 = even[2 * (k + N / 4) + 0] - zdi;
+		auto ui3 = even[2 * (k + N / 4) + 1] + zdr;
+		xout[2 * k] = ur0;
+		xout[2 * k + 1] = ui0;
+		xout[2 * (k + N / 4)] = ur1;
+		xout[2 * (k + N / 4) + 1] = ui1;
+		xout[2 * (k + N / 2)] = ur2;
+		xout[2 * (k + N / 2) + 1] = ui2;
+		xout[2 * (k + 3 * N / 4)] = ur3;
+		xout[2 * (k + 3 * N / 4) + 1] = ui3;
+		/*if (k == 0) {
+		 auto tr1 = odd[2 * k];
+		 auto ti1 = odd[2 * k + 1];
+		 xout[2 * k] = even[2 * k] + tr;
+		 xout[2 * (k + N / 2)] = even[2 * k] - tr;
+		 xout[2 * k + 1] = even[2 * k + 1] + ti;
+		 xout[2 * (k + N / 2) + 1] = even[2 * k + 1] - ti;
+		 } else if (k == N / 2) {
+		 auto tr = -odd[2 * k];
+		 auto ti = -odd[2 * k + 1];
+		 xout[2 * k] = even[2 * k] + tr;
+		 xout[2 * (k + N / 2)] = even[2 * k] - tr;
+		 xout[2 * k + 1] = even[2 * k + 1] + ti;
+		 xout[2 * (k + N / 2) + 1] = even[2 * k + 1] - ti;
+		 } else if (k == N / 4) {
+		 auto tr = odd[2 * k + 1];
+		 auto ti = -odd[2 * k];
+		 xout[2 * k] = even[2 * k] + tr;
+		 xout[2 * (k + N / 2)] = even[2 * k] - tr;
+		 xout[2 * k + 1] = even[2 * k + 1] + ti;
+		 xout[2 * (k + N / 2) + 1] = even[2 * k + 1] - ti;
+		 } else if (k == 3 * N / 4) {
+		 auto tr = -odd[2 * k + 1];
+		 auto ti = odd[2 * k];
+		 xout[2 * k] = even[2 * k] + tr;
+		 xout[2 * (k + N / 2)] = even[2 * k] - tr;
+		 xout[2 * k + 1] = even[2 * k + 1] + ti;
+		 xout[2 * (k + N / 2) + 1] = even[2 * k + 1] - ti;
+		 } else {
+		 auto twr = dag_node::create(cos(theta));
+		 auto twi = dag_node::create(sin(theta));
+		 auto tr = odd[2 * k] * twr - odd[2 * k + 1] * twi;
+		 auto ti = odd[2 * k] * twi + odd[2 * k + 1] * twr;
+		 xout[2 * k] = even[2 * k] + tr;
+		 xout[2 * (k + N / 2)] = even[2 * k] - tr;
+		 xout[2 * k + 1] = even[2 * k + 1] + ti;
+		 xout[2 * (k + N / 2) + 1] = even[2 * k + 1] - ti;
+		 }*/
+	}
+	return xout;
+}
+
 std::unordered_set<dag_node*> dag_node::directory;
 std::set<std::string> dag_node::unused_names;
 std::unordered_map<std::string, dag_node*> dag_node::used_names;
@@ -393,20 +623,22 @@ int dag_node::var_cnt = 0;
 
 int main() {
 	std::vector<dag_ptr> input;
-	int N = 128;
+	int N = 8;
 	for (int n = 0; n < 2 * N; n++) {
 		input.push_back(dag_node::create(INPUT, std::string("x[") + std::to_string(n) + "]"));
 	}
 
-	auto output = fft_radix2(input, N);
+	auto output = fft_radix4(input, N);
 	input.clear();
 	for (int n = 0; n < 2 * N; n++) {
 		output[n] = dag_node::create(n, output[n]);
 	}
+	fprintf(stderr, "op count = %i\n", dag_node::op_count());
+	dag_node::propagate_signs();
+	fprintf(stderr, "op count = %i\n", dag_node::op_count());
 	auto prog = dag_node::generate_program();
 	print_test_header();
 	print_code(prog, "test", 2 * N, 2 * N);
-	fprintf(stderr, "op cnt = %i\n", prog.size());
 	print_test_code(N);
 	return 0;
 }
