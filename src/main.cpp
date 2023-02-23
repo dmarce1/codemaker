@@ -4,8 +4,10 @@
 #include <vector>
 #include <cmath>
 #include <string>
-#include <stack>
+#include <set>
+#include <cassert>
 #include <unordered_set>
+#include <unordered_map>
 
 enum dag_type {
 	CONSTANT = 0, INPUT = 1, ADD = 2, SUB = 3, NEG = 4, MUL = 5, DIV = 6, FMA = 7, OUTPUT = 8
@@ -17,21 +19,41 @@ using dag_ptr = std::shared_ptr<dag_node>;
 
 class dag_node {
 	static std::unordered_set<dag_node*> directory;
-	static std::stack<std::string> names;
+	static std::set<std::string> unused_names;
+	static std::unordered_map<std::string, dag_node*> used_names;
 	static int var_cnt;
+	int outnum;
 	dag_type type;
 	std::vector<dag_ptr> inputs;
 	std::string name;
 	dag_node* self;
 	double value;
-	static std::string gen_varname() {
-		if (names.empty()) {
-			return std::string("r") + std::to_string(var_cnt++);
-		} else {
-			auto nm = names.top();
-			names.pop();
-			return nm;
+	std::string reserve_name(std::string nm) {
+		std::string cmd;
+		auto i = unused_names.find(nm);
+		if (i != unused_names.end()) {
+			unused_names.erase(i);
+			used_names.insert(std::make_pair(nm, this));
+		} else if (used_names.find(nm) != used_names.end()) {
+			auto* oldptr = used_names[nm];
+			used_names[nm] = this;
+			oldptr->name = gen_varname(oldptr);
+			cmd = oldptr->name + " = " + nm + ";";
 		}
+		name = nm;
+		return cmd;
+	}
+	static std::string gen_varname(dag_node* ptr) {
+		std::string str;
+		if (unused_names.empty()) {
+			str = std::string("r") + std::to_string(var_cnt++);
+		} else {
+			auto nm = *unused_names.begin();
+			unused_names.erase(unused_names.begin());
+			str = nm;
+		}
+		used_names[str] = ptr;
+		return str;
 	}
 public:
 	static int var_count() {
@@ -67,10 +89,22 @@ public:
 		ptr->self = ptr.get();
 		ptr->type = t;
 		ptr->name = nm;
+		if (nm != "") {
+			used_names.insert(std::make_pair(nm, ptr.get()));
+		}
 		directory.insert(ptr.get());
 		if (in1) {
 			ptr->inputs.push_back(in1);
 		}
+		return ptr;
+	}
+	static dag_ptr create(int outnum, dag_ptr in1) {
+		auto ptr = std::make_shared<dag_node>();
+		ptr->self = ptr.get();
+		ptr->type = OUTPUT;
+		ptr->outnum = outnum;
+		ptr->inputs.push_back(in1);
+		directory.insert(ptr.get());
 		return ptr;
 	}
 	bool deps_satisfied() const {
@@ -89,16 +123,18 @@ public:
 			for (auto i = directory.begin(); i != directory.end(); i++) {
 				if ((*i)->inputs.size() && (*i)->deps_satisfied()) {
 					found_one = true;
-					code.push_back((*i)->gen_code());
+					auto tmp = (*i)->gen_code();
+					code.insert(code.end(), tmp.begin(), tmp.end());
 					break;
 				}
 			}
 		}
 		return code;
 	}
-	std::string gen_code() {
-		if (name == "" && !type == CONSTANT) {
-			name = gen_varname();
+	std::vector<std::string> gen_code() {
+		std::vector<std::string> cmds;
+		if (name == "" && type != CONSTANT && type != OUTPUT && type != INPUT) {
+			name = gen_varname(this);
 		}
 		std::string code;
 		switch (type) {
@@ -122,17 +158,28 @@ public:
 			code = name + " = std::fma(" + inputs[0]->name + ", " + inputs[1]->name + ", " + inputs[2]->name + ";";
 			break;
 		case OUTPUT:
+			std::string oname = "x[" + std::to_string(outnum) + "]";
+			auto cmd = reserve_name(oname);
+			if (cmd != "") {
+				cmds.push_back(cmd);
+			}
+			assert(oname == name);
 			code = name + " = " + inputs[0]->name + ";";
 			break;
 		}
 		inputs.resize(0);
-		return code;
+		cmds.push_back(code);
+		return cmds;
 	}
 	~dag_node() {
 		if (directory.find(self) == directory.end()) {
 			printf("Can't find self\n");
 		} else {
 			directory.erase(self);
+		}
+		if (name != "" && type != CONSTANT) {
+			unused_names.insert(name);
+			used_names.erase(name);
 		}
 	}
 
@@ -167,7 +214,7 @@ void print_test_header() {
 }
 
 void print_code(std::vector<std::string> code, std::string fname, int incount, int outcount) {
-	printf("std::vector<double> %s(std::vector<double> xn) {;\n", fname.c_str());
+	printf("std::vector<double> %s(std::vector<double>& x) {;\n", fname.c_str());
 	printf("\tstd::vector<double> Xk(%i);\n", outcount);
 	printf("\tdouble ");
 	for (int i = 0; i < dag_node::var_count(); i++) {
@@ -180,6 +227,7 @@ void print_code(std::vector<std::string> code, std::string fname, int incount, i
 	for (auto line : code) {
 		printf("\t%s\n", line.c_str());
 	}
+	printf("\tXk = x;\n");
 	printf("\treturn std::move(Xk);\n");
 	printf("}\n");
 }
@@ -339,25 +387,27 @@ std::vector<dag_ptr> fft_radix2(std::vector<dag_ptr> xin, int N) {
 }
 
 std::unordered_set<dag_node*> dag_node::directory;
-std::stack<std::string> dag_node::names;
+std::set<std::string> dag_node::unused_names;
+std::unordered_map<std::string, dag_node*> dag_node::used_names;
 int dag_node::var_cnt = 0;
 
 int main() {
 	std::vector<dag_ptr> input;
-	int N = 8;
+	int N = 128;
 	for (int n = 0; n < 2 * N; n++) {
-		input.push_back(dag_node::create(INPUT, std::string("xn[") + std::to_string(n) + "]"));
+		input.push_back(dag_node::create(INPUT, std::string("x[") + std::to_string(n) + "]"));
 	}
 
 	auto output = fft_radix2(input, N);
 	input.clear();
 	for (int n = 0; n < 2 * N; n++) {
-		output[n] = dag_node::create(OUTPUT, std::string("Xk[") + std::to_string(n) + "]", output[n]);
+		output[n] = dag_node::create(n, output[n]);
 	}
 	auto prog = dag_node::generate_program();
 	print_test_header();
 	print_code(prog, "test", 2 * N, 2 * N);
-	print_test_code( N);
+	fprintf(stderr, "op cnt = %i\n", prog.size());
+	print_test_code(N);
 	return 0;
 }
 
