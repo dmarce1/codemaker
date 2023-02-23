@@ -465,7 +465,7 @@ void print_test_code(int N) {
 					"\tstd::vector<double> xin(2 * N);\n"
 					"\tstd::vector<std::complex<double>> y(N);\n"
 					"\ttimer tm1, tm2;\n"
-					"\tfor( int i = 0; i < 1; i++) {\n"
+					"\tfor( int i = 0; i < 256; i++) {\n"
 					"\t\tfor( int n = 0; n < 2 * N; n++) {\n"
 					"\t\t\txin[n] = rand1();\n"
 					"\t\t\tif( n %% 2 == 0 ) {\n"
@@ -484,10 +484,10 @@ void print_test_code(int N) {
 					"\t\tfor( int n = 0; n < N; n++) {\n"
 					"\t\t\terror += std::pow(xout[2 * n] - y[n].real(), 2);\n"
 					"\t\t\terror += std::pow(xout[2 * n + 1] - y[n].imag(), 2);\n"
-					"\t\t\tprintf( \"%%i %%e %%e %%e %%e;\\n\", n, xout[2*n], xout[2*n+1], y[n].real(), y[n].imag())\n;\n"
+					"\t\t\t//printf( \"%%i %%e %%e %%e %%e;\\n\", n, xout[2*n], xout[2*n+1], y[n].real(), y[n].imag())\n;\n"
 					"\t\t}\n"
 					"\t\terror = error / (2.0 * N);\n"
-					"\t\tif( i == 0 ) {\n"
+					"\t\tif( i == 255 ) {\n"
 					"\t\t\tprintf( \"Error = %%e\\n\", error );\n"
 					"\t\t}\n"
 					"\t}\n"
@@ -681,7 +681,7 @@ int dag_node::var_cnt = 0;
 
 int main() {
 	std::vector<dag_ptr> input;
-	int N = 32;
+	int N = 128;
 	for (int n = 0; n < 2 * N; n++) {
 		input.push_back(dag_node::create(INPUT, std::string("x[") + std::to_string(n) + "]"));
 	}
